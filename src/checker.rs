@@ -5,6 +5,15 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use pnet::datalink::{self, Channel};
+use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
+use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::udp::UdpPacket;
+use pnet::packet::Packet;
+
+
 pub fn analyze_interfaces() 
 {
     for iface in interfaces() 
@@ -73,7 +82,6 @@ pub struct DeviceInfo {
     pub mac: Option<String>,
     pub hostname: Option<String>,
     pub open_ports: Vec<u16>,
-    pub os_fingerprint: Option<String>,
     pub services: Vec<String>,
 }
 
@@ -140,14 +148,12 @@ impl NetworkScanner {
         let host_count = 2u32.pow(host_bits as u32) - 2;
         
         if prefix >= 24 {
-            // Для /24 и больше сетей
             for i in 1..=254 {
                 if i != base_octets[3] {
                     hosts.push(Ipv4Addr::new(base_octets[0], base_octets[1], base_octets[2], i));
                 }
             }
         } else {
-            // Для больших сетей сканируем только часть
             for i in 1..=host_count.min(1000) {
                 let ip = self.calculate_ip(network, prefix, i);
                 hosts.push(ip);
@@ -170,7 +176,6 @@ impl NetworkScanner {
     }
     
     fn scan_host(ip: Ipv4Addr, timeout: Duration) -> Option<DeviceInfo> {
-        // Проверяем доступность хоста
         if !Self::is_host_alive(ip, timeout) {
             return None;
         }
@@ -182,7 +187,6 @@ impl NetworkScanner {
             mac: Self::get_mac_address(ip),
             hostname: Self::get_hostname(ip),
             open_ports: Self::scan_ports(ip, timeout),
-            os_fingerprint: Self::fingerprint_os(ip),
             services: Vec::new(),
         };
         
@@ -192,13 +196,10 @@ impl NetworkScanner {
     }
     
     fn is_host_alive(ip: Ipv4Addr, timeout: Duration) -> bool {
-        // Метод 1: TCP соединение
         if TcpStream::connect_timeout(&SocketAddr::from((ip, 80)), timeout).is_ok() {
             return true;
         }
-        
-        // Метод 2: ICMP (эмуляция через TCP на разных портах)
-        let ports = [22, 135, 443, 3389]; // Часто используемые порты
+        let ports = [22, 135, 443, 3389];
         for &port in &ports {
             if TcpStream::connect_timeout(&SocketAddr::from((ip, port)), timeout).is_ok() {
                 return true;
@@ -209,8 +210,6 @@ impl NetworkScanner {
     }
     
     fn get_mac_address(_ip: Ipv4Addr) -> Option<String> {
-        // В реальном приложении здесь будет ARP-запрос
-        // Для простоты возвращаем None
         None
     }
     
@@ -239,12 +238,6 @@ impl NetworkScanner {
         open_ports
     }
     
-    fn fingerprint_os(_ip: Ipv4Addr) -> Option<String> {
-        // Базовая эвристика определения ОС по открытым портам
-        // В реальном приложении используйте более сложные методы
-        None
-    }
-    
     fn identify_services(ports: &[u16]) -> Vec<String> {
         let service_map: HashMap<u16, &str> = [
             (21, "FTP"), (22, "SSH"), (23, "Telnet"), (25, "SMTP"),
@@ -258,5 +251,170 @@ impl NetworkScanner {
         ports.iter()
             .filter_map(|port| service_map.get(port).map(|s| s.to_string()))
             .collect()
+    }
+}
+
+//########################################################################################3
+
+pub struct TrafficAnalyzer {
+    stats: HashMap<String, usize>,
+}
+
+impl TrafficAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            stats: HashMap::new(),
+        }
+    }
+    
+    pub fn start_sniffing(&mut self, interface_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let interface = datalink::interfaces()
+            .into_iter()
+            .find(|iface| iface.name == interface_name)
+            .ok_or("Интерфейс не найден")?;
+        
+        let (_tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+            Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+            Ok(_) => return Err("Непподерживаемый тип соединения".into()),
+            Err(e) => return Err(e.into()),
+        };
+        
+        println!("👂 Начинаем прослушивание на интерфейсе: {}", interface_name);
+        
+        loop {
+            match rx.next() {
+                Ok(packet) => {
+                    self.process_packet(&packet);
+                }
+                Err(e) => {
+                    eprintln!("Ошибка при чтении пакета: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn process_packet(&mut self, packet: &[u8]) {
+        if let Some(ethernet) = EthernetPacket::new(packet) {
+            match ethernet.get_ethertype() {
+                EtherTypes::Ipv4 => {
+                    if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
+                        self.analyze_ip_packet(&ipv4);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    fn analyze_ip_packet(&mut self, ip_packet: &Ipv4Packet) {
+        let src = ip_packet.get_source();
+        let dst = ip_packet.get_destination();
+        let protocol = ip_packet.get_next_level_protocol();
+        
+        // Собираем статистику
+        *self.stats.entry(format!("{:?}", protocol)).or_insert(0) += 1;
+        
+        match protocol {
+            IpNextHeaderProtocols::Tcp => {
+                if let Some(tcp) = TcpPacket::new(ip_packet.payload()) {
+                    println!("📨 TCP: {}:{} -> {}:{} [{} bytes]", 
+                             src, tcp.get_source(), 
+                             dst, tcp.get_destination(),
+                             ip_packet.get_total_length());
+                }
+            }
+            IpNextHeaderProtocols::Udp => {
+                if let Some(udp) = UdpPacket::new(ip_packet.payload()) {
+                    println!("📨 UDP: {}:{} -> {}:{} [{} bytes]",
+                             src, udp.get_source(),
+                             dst, udp.get_destination(),
+                             ip_packet.get_total_length());
+                }
+            }
+            IpNextHeaderProtocols::Icmp => {
+                println!("📨 ICMP: {} -> {}", src, dst);
+            }
+            _ => {}
+        }
+    }
+    
+    pub fn print_stats(&self) {
+        println!("\n=== СТАТИСТИКА ТРАФИКА ===");
+        for (protocol, count) in &self.stats {
+            println!("{}: {} пакетов", protocol, count);
+        }
+    }
+}
+
+//###################################################################
+
+
+pub fn analyze_network() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🌐 КОМПЛЕКСНЫЙ АНАЛИЗ ЛОКАЛЬНОЙ СЕТИ");
+    println!("====================================\n");
+
+    analyze_interfaces();
+    
+
+    if let Some((local_ip, prefix)) = get_local_network() {
+        println!("\n📍 Локальная сеть: {}/{}", local_ip, prefix);
+        
+
+        let scanner = NetworkScanner::new()
+            .set_timeout(Duration::from_millis(500));
+        
+        let devices = scanner.comprehensive_scan(local_ip, prefix);
+        
+
+        println!("\n=== ОБНАРУЖЕННЫЕ УСТРОЙСТВА ===");
+        for device in devices {
+            println!("\n🖥️  Устройство: {}", device.ip);
+            if let Some(hostname) = device.hostname {
+                println!("   Название: {}", hostname);
+            }
+            if let Some(mac) = device.mac {
+                println!("   MAC: {}", mac);
+            }
+            println!("   Открытые порты: {:?}", device.open_ports);
+            println!("   Службы: {:?}", device.services);
+        }
+        
+        analyze_routing();
+        
+    } else {
+        println!("❌ Не удалось определить локальную сеть");
+    }
+    
+    Ok(())
+}
+
+fn analyze_routing() {
+    println!("\n=== ТАБЛИЦА МАРШРУТИЗАЦИИ ===");
+    
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("route")
+            .arg("print")
+            .output()
+            .expect("Failed to execute route command");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("ip")
+            .arg("route")
+            .output()
+            .expect("Failed to execute ip command");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("netstat")
+            .arg("-nr")
+            .output()
+            .expect("Failed to execute netstat command");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
     }
 }

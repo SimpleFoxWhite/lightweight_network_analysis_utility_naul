@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr};
 use std::str::FromStr;
 use std::time::Duration;
 
-use checker::{analyze_interfaces, NetworkScanner};
+use checker::{analyze_interfaces, NetworkScanner, TrafficAnalyzer, analyze_network};
 
 
 fn main() 
@@ -20,11 +20,12 @@ fn main()
             {
                 println!("Использование: {} [OPTIONS]", args[0]);
                 println!("Options:");
-                println!("  -h,  --help                                Показать эту справку");
-                println!("  -v,  --version                             Показать версию");
-                println!("  -i,  --interfaces                          Показать локальные интерфейсы");
-                println!("  -an, --analyze_network (параметр)/(маска)  Полный анализ сети");
-                println!("  -a,  --analyze                             Анализировать сеть");
+                println!("  -h,    --help                                  Показать эту справку");
+                println!("  -v,    --version                               Показать версию");
+                println!("  -i,    --interfaces                            Показать локальные интерфейсы");
+                println!("  -an,   --analyze_network (параметр)/(маска)    Полный анализ сети");
+                println!("  -a,    --analyze (параметр)                    Анализировать сеть");
+                println!("  -all,  --just_work                             Анализировать сеть");
                 return;
             }
 
@@ -42,19 +43,15 @@ fn main()
 
             "-an" | "--analyze_network" => 
             {
-                // Проверяем, есть ли следующий аргумент (параметр)
                 if i + 1 < args.len() 
                 {
                     let target = &args[i+1];
                     println!("Анализ сети: {}", target);
-
-                    // Ищем позицию разделителя '/'
                     if let Some(slash_pos) = target.find('/') 
                     {
                         let ip = &target[0..slash_pos];
                         let pref = &target[slash_pos + 1..]; // +1 чтобы пропусить '/'
                         
-                        // Дополнительная валидация
                         if let Ok(prefix_num) = pref.parse::<u8>() 
                         {
                             if prefix_num > 31 
@@ -98,6 +95,19 @@ fn main()
 
             "-a" | "--analysing" =>
             {
+                if i + 1 < args.len()
+                {
+                    let target = &args[i+1];
+                    println!("Работа с: {}", target);
+                    let mut trafficAnalyzer  = TrafficAnalyzer::new();
+                    trafficAnalyzer.start_sniffing(target);
+                }
+                return;
+            }
+
+            "-all" | "--just_work" =>
+            {
+                analyze_network();
                 return;
             }
 
